@@ -1,0 +1,1 @@
+"""OMSCS ingestion service package."""
