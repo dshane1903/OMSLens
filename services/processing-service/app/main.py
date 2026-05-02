@@ -26,12 +26,12 @@ async def poll_loop() -> None:
         except Exception:
             logger.exception("Error processing documents")
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
-  
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global _background_task
     from shared.utils.db import ensure_schema
- 
+
     ensure_schema()
     _background_task = asyncio.create_task(poll_loop())
     logger.info("Processing worker started (polling every %ds)", POLL_INTERVAL_SECONDS)

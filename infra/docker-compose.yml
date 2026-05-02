@@ -9,6 +9,7 @@ services:
       - "8000:8000"
     depends_on:
       - ingestion-service
+      - processing-service
       - retrieval-service
 
   ingestion-service:
@@ -23,6 +24,18 @@ services:
       - documents:/data/documents
     depends_on:
       - postgres
+
+  processing-service:
+    build:
+      context: ..
+      dockerfile: services/processing-service/Dockerfile
+    env_file:
+      - ../.env.example
+    ports:
+      - "8005:8005"
+    depends_on:
+      - postgres
+      - embedding-service
 
   embedding-service:
     build:
