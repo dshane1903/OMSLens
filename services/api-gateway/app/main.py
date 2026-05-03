@@ -10,9 +10,11 @@ from shared.schemas.models import (
     RedditScrapeResponse,
 )
 from shared.utils.config import get_settings
+from shared.utils.observability import instrument_fastapi_app
 from shared.utils.service_client import post_json
 
 app = FastAPI(title="OMSCS Course Intelligence API Gateway", version="0.2.0")
+instrument_fastapi_app(app, "api-gateway")
 settings = get_settings()
 
 

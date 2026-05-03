@@ -3,8 +3,10 @@ from fastapi import FastAPI
 from shared.schemas.models import GenerateAnswerRequest
 from shared.utils.ai import fallback_answer, get_openai_client, has_openai_credentials
 from shared.utils.config import get_settings
+from shared.utils.observability import instrument_fastapi_app
 
 app = FastAPI(title="RAG LLM Service", version="0.1.0")
+instrument_fastapi_app(app, "llm-service")
 settings = get_settings()
 
 

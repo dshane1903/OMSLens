@@ -105,6 +105,19 @@ The RabbitMQ management UI is exposed on http://localhost:15672
 (user: `rag`, password: `rag`) — useful for inspecting queue depth, the
 DLQ, and message rates while developing.
 
+## Observability
+
+Every FastAPI service exposes Prometheus metrics at `/metrics`. The local
+compose stack also starts Prometheus and Grafana:
+
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (user: `admin`, password: `admin`)
+- RabbitMQ metrics: http://localhost:15692/metrics
+
+Grafana is provisioned with the Prometheus datasource and an `OMSCS Service
+Overview` dashboard covering request rate, 5xx rate, p95 latency, in-flight
+requests, RabbitMQ queue depth, and scrape health.
+
 ## Tests
 
 ```bash
@@ -120,6 +133,5 @@ PYTHONPATH=. \
 
 ## Next Build Targets
 
-- add Prometheus metrics on every service and Grafana dashboards
 - deploy to a public host and put it in front of OMSCS students
 - citation rendering on retrieved answers

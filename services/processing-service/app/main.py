@@ -11,6 +11,7 @@ from app.worker import process_one_document, process_unchunked_documents
 from shared.schemas.models import DocumentIngestedEvent
 from shared.utils.config import get_settings
 from shared.utils.messaging import consume_documents
+from shared.utils.observability import instrument_fastapi_app
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,6 +128,7 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+instrument_fastapi_app(app, "processing-service")
 
 
 @app.get("/health")

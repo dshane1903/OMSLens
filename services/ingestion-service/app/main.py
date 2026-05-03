@@ -19,8 +19,10 @@ from shared.schemas.models import (
 from shared.utils.config import get_settings
 from shared.utils.db import db_connection, ensure_schema
 from shared.utils.messaging import publish_document_ingested
+from shared.utils.observability import instrument_fastapi_app
 
 app = FastAPI(title="OMSCS Ingestion Service", version="0.2.0")
+instrument_fastapi_app(app, "ingestion-service")
 settings = get_settings()
 
 

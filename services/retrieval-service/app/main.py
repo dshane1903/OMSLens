@@ -5,9 +5,11 @@ from shared.schemas.models import QueryRequest, QueryResponse, RetrievedChunk
 from shared.utils.cache import get_cached_json, set_cached_json
 from shared.utils.config import get_settings
 from shared.utils.db import db_connection, ensure_schema, serialize_vector
+from shared.utils.observability import instrument_fastapi_app
 from shared.utils.service_client import post_json
 
 app = FastAPI(title="RAG Retrieval Service", version="0.1.0")
+instrument_fastapi_app(app, "retrieval-service")
 settings = get_settings()
 
 
