@@ -320,7 +320,7 @@ def upsert_reddit_documents(documents: list[RedditDocument]) -> int:
                         "source_document_id": doc.source_document_id,
                         "title": doc.title,
                         "url": doc.url,
-                        "course_id": doc.course_id,
+                        "course_id": None,  # Don't FK-link; course context lives in slug/name/codes
                         "course_slug": doc.course_slug,
                         "course_name": doc.course_name,
                         "course_codes": doc.course_codes,
