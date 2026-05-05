@@ -876,6 +876,15 @@ function MarkdownAnswer({ text }: { text: string }) {
           );
         }
 
+        if (block.type === "table") {
+          return (
+            <MarkdownTable
+              block={block}
+              key={`${block.type}-${index}`}
+            />
+          );
+        }
+
         if (block.type === "quote") {
           return (
             <blockquote
@@ -898,7 +907,13 @@ function MarkdownAnswer({ text }: { text: string }) {
 }
 
 type MarkdownBlock = {
-  type: "heading" | "ordered-list" | "unordered-list" | "paragraph" | "quote";
+  type:
+    | "heading"
+    | "ordered-list"
+    | "unordered-list"
+    | "paragraph"
+    | "quote"
+    | "table";
   lines: string[];
 };
 
@@ -929,6 +944,9 @@ function parseMarkdownBlocks(text: string): MarkdownBlock[] {
     }
 
     const type = getMarkdownLineType(line);
+    if (type === "table-separator") {
+      continue;
+    }
     if (!pending || pending.type !== type || type === "heading") {
       flush();
       pending = { type, lines: [] };
@@ -940,7 +958,7 @@ function parseMarkdownBlocks(text: string): MarkdownBlock[] {
   return blocks;
 }
 
-function getMarkdownLineType(line: string): MarkdownBlock["type"] {
+function getMarkdownLineType(line: string): MarkdownBlock["type"] | "table-separator" {
   if (/^\d+\.\s+/.test(line)) {
     return "ordered-list";
   }
@@ -950,7 +968,70 @@ function getMarkdownLineType(line: string): MarkdownBlock["type"] {
   if (/^>\s?/.test(line)) {
     return "quote";
   }
+  if (isMarkdownTableSeparator(line)) {
+    return "table-separator";
+  }
+  if (isMarkdownTableRow(line)) {
+    return "table";
+  }
   return "paragraph";
+}
+
+function isMarkdownTableRow(line: string) {
+  return line.startsWith("|") && line.endsWith("|") && line.split("|").length >= 4;
+}
+
+function isMarkdownTableSeparator(line: string) {
+  return /^\|?[\s:-]*---[\s|:-]*\|?$/.test(line);
+}
+
+function MarkdownTable({ block }: { block: MarkdownBlock }) {
+  const rows = block.lines.map(parseMarkdownTableRow).filter((row) => row.length > 0);
+  if (rows.length === 0) {
+    return null;
+  }
+  const [header, ...body] = rows;
+
+  return (
+    <div className="overflow-x-auto rounded-lg border border-paper/15">
+      <table className="min-w-full border-collapse text-left text-sm leading-6">
+        <thead className="bg-paper/10 text-paper">
+          <tr>
+            {header.map((cell, index) => (
+              <th
+                className="border-b border-paper/15 px-3 py-2 font-semibold"
+                key={`${cell}-${index}`}
+              >
+                {renderInlineMarkdown(cell)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((row, rowIndex) => (
+            <tr className="border-t border-paper/10" key={rowIndex}>
+              {row.map((cell, cellIndex) => (
+                <td
+                  className="align-top px-3 py-2 text-paper/82"
+                  key={`${rowIndex}-${cellIndex}`}
+                >
+                  {renderInlineMarkdown(cell)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function parseMarkdownTableRow(line: string) {
+  return line
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
 }
 
 function renderInlineMarkdown(text: string): ReactNode[] {
