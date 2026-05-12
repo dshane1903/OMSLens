@@ -1,7 +1,8 @@
 """
 Reddit scraper for r/OMSCS course discussions.
 
-Uses Reddit's public JSON API (no OAuth required for public subreddits).
+Uses Reddit's OAuth API when credentials are configured, otherwise falls back
+to Reddit's public JSON API for local development.
 Each post + its top comments becomes a single document, linked to a course
 when the post title or body mentions a known course code.
 """
@@ -11,7 +12,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
@@ -26,6 +27,51 @@ logger = logging.getLogger("reddit-scraper")
 SUBREDDIT = "OMSCS"
 MAX_COMMENTS_PER_POST = 15
 REQUEST_DELAY_SECONDS = 1.2  # Reddit asks for ~1 req/sec unauthenticated
+DEFAULT_SEARCH_MODES = ("relevance_all", "top_all", "top_year", "new_year")
+SEARCH_MODE_PARAMS = {
+    "relevance_all": {"sort": "relevance", "time_filter": "all"},
+    "top_all": {"sort": "top", "time_filter": "all"},
+    "top_year": {"sort": "top", "time_filter": "year"},
+    "new_year": {"sort": "new", "time_filter": "year"},
+    "comments_all": {"sort": "comments", "time_filter": "all"},
+}
+
+COURSE_ALIASES: dict[str, tuple[str, ...]] = {
+    "advanced-operating-systems": ("AOS",),
+    "ai-ethics-and-society": ("AI Ethics", "AIES"),
+    "artificial-intelligence": ("AI",),
+    "artificial-intelligence-for-robotics": ("AI4R", "RAIT"),
+    "bayesian-statistics": ("Bayes",),
+    "big-data-for-health-informatics": ("BD4H",),
+    "computer-networks": ("CN",),
+    "computer-vision": ("CV",),
+    "database-system-concepts-and-design": ("DBSD", "DBS"),
+    "deep-learning": ("DL",),
+    "deterministic-optimization": ("DO",),
+    "distributed-computing": ("DC",),
+    "educational-technology": ("EdTech",),
+    "graduate-introduction-to-operating-systems": ("GIOS",),
+    "gpu-hardware-and-software": ("GPU",),
+    "high-performance-computer-architecture": ("HPCA",),
+    "high-performance-computing": ("HPC", "IHPC"),
+    "human-computer-interaction": ("HCI",),
+    "introduction-to-analytics-modeling": ("IAM", "IYSE 6501"),
+    "introduction-to-cognitive-science": ("CogSci",),
+    "introduction-to-graduate-algorithms": ("GA",),
+    "introduction-to-information-security": ("IIS",),
+    "knowledge-based-ai": ("KBAI",),
+    "machine-learning": ("ML",),
+    "machine-learning-for-trading": ("ML4T",),
+    "natural-language-processing": ("NLP",),
+    "network-science": ("NetSci",),
+    "network-security": ("NetSec", "NS"),
+    "reinforcement-learning": ("RL",),
+    "simulation-and-modeling-for-engineering-and-science": ("Sim", "Simulation"),
+    "software-analysis-and-test": ("SAT",),
+    "software-architecture-and-design": ("SAD",),
+    "software-development-process": ("SDP",),
+    "system-design-for-cloud-computing": ("SDCC",),
+}
 
 
 def build_reddit_document_id(post_id: str) -> str:
@@ -38,6 +84,79 @@ def build_source_document_id(post_id: str) -> str:
 
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def normalize_course_code(code: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", code.upper())
+
+
+def course_code_variants(code: str) -> list[str]:
+    normalized = normalize_course_code(code)
+    match = re.match(r"^([A-Z]{2,4})(\d{4}[A-Z]*)$", normalized)
+    if not match:
+        return [code]
+    subject, number = match.groups()
+    return [
+        f"{subject} {number}",
+        f"{subject}-{number}",
+        f"{subject}{number}",
+    ]
+
+
+def course_aliases(course: CourseCatalogEntry) -> list[str]:
+    aliases = list(COURSE_ALIASES.get(course.slug, ()))
+    metadata_aliases = course.metadata.get("aliases") if course.metadata else None
+    if isinstance(metadata_aliases, list):
+        aliases.extend(str(alias) for alias in metadata_aliases if alias)
+    return unique_preserving_order(aliases)
+
+
+def unique_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        normalized = normalize_text(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(value)
+    return unique
+
+
+def build_course_search_queries(
+    course: CourseCatalogEntry,
+    include_aliases: bool = True,
+) -> list[str]:
+    queries: list[str] = []
+    for code in course.codes:
+        queries.extend(course_code_variants(code))
+        for variant in course_code_variants(code):
+            queries.append(f"{variant} OMSCS")
+
+    queries.append(course.name)
+    queries.append(f"{course.name} OMSCS")
+
+    if include_aliases:
+        for alias in course_aliases(course):
+            queries.append(alias)
+            queries.append(f"{alias} OMSCS")
+            if course.codes:
+                queries.append(f"{alias} {course.codes[0]}")
+
+    return unique_preserving_order(queries)
+
+
+def search_modes_to_params(
+    search_modes: list[str] | tuple[str, ...] | None,
+) -> list[dict[str, str]]:
+    modes = search_modes or DEFAULT_SEARCH_MODES
+    params: list[dict[str, str]] = []
+    for mode in modes:
+        if mode not in SEARCH_MODE_PARAMS:
+            logger.warning("Unknown Reddit search mode %r; skipping", mode)
+            continue
+        params.append(SEARCH_MODE_PARAMS[mode])
+    return params or [SEARCH_MODE_PARAMS["relevance_all"]]
 
 
 def match_course(
@@ -64,6 +183,12 @@ def match_course(
         # Also try matching on the course name
         if course.name.lower() in text.lower():
             return course
+
+        for alias in course_aliases(course):
+            if len(alias) < 2:
+                continue
+            if re.search(rf"\b{re.escape(alias)}\b", text, flags=re.IGNORECASE):
+                return course
 
     return None
 
@@ -222,32 +347,68 @@ def post_to_document(
 
 
 class RedditClient:
-    """
-    Async client for Reddit's public JSON API.
-
-    No OAuth required — uses unauthenticated endpoints with a polite
-    User-Agent and rate limiting.
-    """
+    """Async client for Reddit API endpoints with optional OAuth."""
 
     def __init__(self, settings: "Settings") -> None:
         import httpx
 
         self._settings = settings
+        self._access_token: str | None = None
+        self._access_token_expires_at = datetime.min.replace(tzinfo=timezone.utc)
+        self._has_oauth_credentials = bool(
+            settings.reddit_client_id and settings.reddit_client_secret
+        )
         self._client = httpx.AsyncClient(
-            base_url="https://www.reddit.com",
+            base_url=(
+                "https://oauth.reddit.com"
+                if self._has_oauth_credentials
+                else "https://www.reddit.com"
+            ),
             timeout=settings.reddit_request_timeout_seconds,
             headers={
                 "User-Agent": settings.reddit_user_agent,
             },
             follow_redirects=True,
         )
+        self._auth_client = httpx.AsyncClient(
+            base_url="https://www.reddit.com",
+            timeout=settings.reddit_request_timeout_seconds,
+            headers={"User-Agent": settings.reddit_user_agent},
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        await self._auth_client.aclose()
+
+    async def _ensure_access_token(self) -> None:
+        if not self._has_oauth_credentials:
+            return
+
+        now = datetime.now(timezone.utc)
+        if self._access_token and now < self._access_token_expires_at:
+            return
+
+        response = await self._auth_client.post(
+            "/api/v1/access_token",
+            data={"grant_type": "client_credentials"},
+            auth=(
+                self._settings.reddit_client_id,
+                self._settings.reddit_client_secret,
+            ),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        self._access_token = payload["access_token"]
+        expires_in = int(payload.get("expires_in", 3600))
+        self._access_token_expires_at = now + timedelta(
+            seconds=max(expires_in - 60, 60),
+        )
+        self._client.headers["Authorization"] = f"Bearer {self._access_token}"
 
     async def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         """Fetch a JSON endpoint with rate-limit delay."""
         await asyncio.sleep(REQUEST_DELAY_SECONDS)
+        await self._ensure_access_token()
         url = path
         if params:
             url = f"{path}?{urlencode(params)}"
@@ -301,6 +462,9 @@ class RedditClient:
         catalog: list[CourseCatalogEntry],
         course_slugs: list[str] | None = None,
         posts_per_course: int = 10,
+        include_aliases: bool = True,
+        search_modes: list[str] | None = None,
+        max_search_results_per_query: int = 25,
     ) -> list[RedditDocument]:
         """
         Search Reddit for discussions about specific courses.
@@ -315,38 +479,79 @@ class RedditClient:
 
         all_docs: list[RedditDocument] = []
         seen_ids: set[str] = set()
+        search_params = search_modes_to_params(search_modes)
 
         for course in courses:
-            # Search by each course code (e.g. "CS 6250")
-            queries = list(course.codes) + [course.name]
-            for query in queries[:2]:  # Limit queries per course
+            queries = build_course_search_queries(course, include_aliases=include_aliases)
+            candidates: dict[str, dict[str, Any]] = {}
+
+            for query in queries:
+                for params in search_params:
+                    try:
+                        posts = await self.search_subreddit(
+                            query,
+                            sort=params["sort"],
+                            time_filter=params["time_filter"],
+                            limit=max_search_results_per_query,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Search failed for %r (%s/%s): %s",
+                            query,
+                            params["sort"],
+                            params["time_filter"],
+                            exc,
+                        )
+                        continue
+
+                    for post_summary in posts:
+                        post_id = post_summary["id"]
+                        candidate = candidates.setdefault(post_id, dict(post_summary))
+                        matched_queries = candidate.setdefault("matched_queries", [])
+                        matched_queries.append(query)
+
+                    if len(candidates) >= posts_per_course * 4:
+                        break
+                if len(candidates) >= posts_per_course * 4:
+                    break
+
+            ranked_candidates = sorted(
+                candidates.values(),
+                key=lambda post: (
+                    len(post.get("matched_queries", [])),
+                    post.get("score", 0),
+                    post.get("num_comments", 0),
+                ),
+                reverse=True,
+            )
+
+            course_docs_created = 0
+            for post_summary in ranked_candidates:
+                if course_docs_created >= posts_per_course:
+                    break
+
+                post_id = post_summary["id"]
+                if post_id in seen_ids:
+                    continue
+                seen_ids.add(post_id)
+
                 try:
-                    posts = await self.search_subreddit(
-                        query,
-                        limit=posts_per_course,
-                    )
+                    post, comments = await self.fetch_post_comments(post_id)
                 except Exception as exc:
-                    logger.error("Search failed for %r: %s", query, exc)
+                    logger.error("Failed to fetch post %s: %s", post_id, exc)
                     continue
 
-                for post_summary in posts:
-                    post_id = post_summary["id"]
-                    if post_id in seen_ids:
-                        continue
-                    seen_ids.add(post_id)
-
-                    try:
-                        post, comments = await self.fetch_post_comments(post_id)
-                    except Exception as exc:
-                        logger.error("Failed to fetch post %s: %s", post_id, exc)
-                        continue
-
-                    # Try to match to a course (might match a different one
-                    # than we searched for)
-                    full_text = f"{post.get('title', '')} {post.get('selftext', '')}"
-                    matched = match_course(full_text, catalog) or course
-                    doc = post_to_document(post, comments, matched)
-                    all_docs.append(doc)
+                full_text = f"{post.get('title', '')} {post.get('selftext', '')}"
+                matched = match_course(full_text, catalog) or course
+                doc = post_to_document(post, comments, matched)
+                doc.metadata.update(
+                    {
+                        "search_course_slug": course.slug,
+                        "matched_queries": post_summary.get("matched_queries", []),
+                    }
+                )
+                all_docs.append(doc)
+                course_docs_created += 1
 
         return all_docs
 

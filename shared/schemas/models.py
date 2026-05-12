@@ -95,6 +95,19 @@ class IndexCoursesRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=500)
 
 
+class IndexRedditRequest(BaseModel):
+    course_slugs: list[str] = Field(default_factory=list)
+    missing_only: bool = True
+    posts_per_course: int = Field(default=25, ge=1, le=100)
+    include_aliases: bool = True
+    search_modes: list[str] = Field(
+        default_factory=lambda: ["relevance_all", "top_all", "top_year", "new_year"]
+    )
+    max_search_results_per_query: int = Field(default=25, ge=1, le=100)
+    process_after: bool = True
+    limit: int | None = Field(default=10, ge=1, le=500)
+
+
 class IndexCoursesResponse(BaseModel):
     job_id: str
     status: str
@@ -149,7 +162,12 @@ class RedditDocument(BaseModel):
 
 class RedditScrapeRequest(BaseModel):
     course_slugs: list[str] = Field(default_factory=list)
-    posts_per_course: int = Field(default=10, ge=1, le=50)
+    posts_per_course: int = Field(default=10, ge=1, le=100)
+    include_aliases: bool = True
+    search_modes: list[str] = Field(
+        default_factory=lambda: ["relevance_all", "top_all", "top_year", "new_year"]
+    )
+    max_search_results_per_query: int = Field(default=25, ge=1, le=100)
     include_recent: bool = True
     recent_limit: int = Field(default=25, ge=1, le=100)
     persist: bool = True
@@ -163,13 +181,48 @@ class RedditScrapeResponse(BaseModel):
     documents: list[RedditDocument] = Field(default_factory=list)
 
 
+class ManualRedditDocumentRequest(BaseModel):
+    course_slug: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=500)
+    url: str = Field(min_length=1, max_length=2000)
+    content: str = Field(min_length=20, max_length=20000)
+    author: str = Field(default="unknown", max_length=100)
+    subreddit: str = Field(default="OMSCS", max_length=100)
+    published_at: datetime | None = None
+    score: int = 0
+    num_comments: int = 0
+    process_after: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ManualRedditDocumentResponse(BaseModel):
+    source: str = "reddit"
+    document_id: str
+    source_document_id: str
+    documents_persisted: int
+    processing_documents_processed: int = 0
+    processing_chunks_created: int = 0
+    status: str
+
+
+class DeleteDocumentsRequest(BaseModel):
+    document_ids: list[str] = Field(min_length=1, max_length=1000)
+    source: str | None = None
+
+
+class DeleteDocumentsResponse(BaseModel):
+    requested_count: int
+    deleted_count: int
+    deleted_document_ids: list[str] = Field(default_factory=list)
+
+
 class GenerateAnswerRequest(BaseModel):
     question: str = Field(min_length=1)
     context: list[str]
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(min_length=1)
+    question: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=5, ge=1, le=20)
 
 

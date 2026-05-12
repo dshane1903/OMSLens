@@ -32,6 +32,25 @@ settings = get_settings()
 RRF_K = 60
 RETRIEVAL_CANDIDATE_MULTIPLIER = 5
 COURSE_CODE_PATTERN = re.compile(r"\b([A-Z]{2,4})[-\s]?(\d{4})\b", re.IGNORECASE)
+SOURCE_HINTS = {
+    "reddit": ("reddit", "subreddit", "r/omscs", "discussion post", "discussion posts", "thread", "threads"),
+    "omscentral": ("omscentral", "oms central"),
+}
+COURSE_ALIASES = {
+    "introduction-to-graduate-algorithms": ("ga",),
+    "machine-learning": ("ml",),
+    "artificial-intelligence": ("ai",),
+    "computer-networks": ("cn",),
+    "software-development-process": ("sdp",),
+    "graduate-introduction-to-operating-systems": ("gios", "ios"),
+    "advanced-operating-systems": ("aos",),
+    "database-systems-concepts-and-design": ("dbs", "database systems"),
+    "human-computer-interaction": ("hci",),
+    "machine-learning-for-trading": ("ml4t",),
+    "deep-learning": ("dl",),
+    "reinforcement-learning-and-decision-making": ("rl", "reinforcement learning"),
+    "natural-language-processing": ("nlp",),
+}
 
 
 @app.on_event("startup")
@@ -149,6 +168,7 @@ def list_course_documents(slug: str) -> CourseDocumentsResponse:
 async def retrieve_context(request: QueryRequest) -> QueryResponse:
     start = time.perf_counter()
     course_scopes = resolve_course_scopes(request.question)
+    source_filter = resolve_source_filter(request.question)
     indexed_course_slugs = [
         scope["slug"] for scope in course_scopes if scope["chunk_count"] > 0
     ]
@@ -165,7 +185,8 @@ async def retrieve_context(request: QueryRequest) -> QueryResponse:
         if course_scopes
         else "any"
     )
-    cache_key = f"query:v5:hybrid_rrf:{scope_slug}:{scope_chunks}:{request.question}:{request.top_k}"
+    source_scope = ",".join(source_filter) if source_filter else "all"
+    cache_key = f"query:v6:hybrid_rrf:{scope_slug}:{scope_chunks}:{source_scope}:{request.question}:{request.top_k}"
     cached = get_cached_json(cache_key)
     if cached:
         RETRIEVAL_CACHE_EVENTS.labels(result="hit").inc()
@@ -194,6 +215,7 @@ async def retrieve_context(request: QueryRequest) -> QueryResponse:
             query_vector,
             request.top_k,
             course_slugs=indexed_course_slugs or None,
+            sources=source_filter,
         )
 
     try:
@@ -201,7 +223,7 @@ async def retrieve_context(request: QueryRequest) -> QueryResponse:
             f"{settings.llm_service_url}/generate",
             {
                 "question": request.question,
-                "context": [chunk.text for chunk in chunks],
+                "context": [format_llm_context(chunk) for chunk in chunks],
             },
         )
     except httpx.HTTPError as exc:
@@ -220,11 +242,31 @@ async def retrieve_context(request: QueryRequest) -> QueryResponse:
     return response
 
 
+def format_llm_context(chunk: RetrievedChunk) -> str:
+    source_label = {
+        "omscentral": "OMSCentral review",
+        "reddit": "Reddit discussion",
+    }.get(chunk.source or "", chunk.source or "unknown source")
+    title = chunk.title or "Untitled source"
+    course = chunk.course_name or chunk.course_slug or "Unknown course"
+    codes = ", ".join(chunk.course_codes) if chunk.course_codes else "unknown code"
+    published = chunk.published_at.isoformat() if chunk.published_at else "unknown date"
+
+    return (
+        f"Source: {source_label}\n"
+        f"Title: {title}\n"
+        f"Course: {course} ({codes})\n"
+        f"Published: {published}\n"
+        f"Evidence:\n{chunk.text}"
+    )
+
+
 def retrieve_hybrid(
     question: str,
     query_vector: list[float],
     top_k: int,
     course_slugs: list[str] | None = None,
+    sources: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     candidate_limit = max(top_k * RETRIEVAL_CANDIDATE_MULTIPLIER, 20)
     vector = serialize_vector(query_vector)
@@ -239,6 +281,7 @@ def retrieve_hybrid(
                             vector,
                             candidate_limit,
                             course_slugs=[course_slug],
+                            sources=sources,
                         )
                         for course_slug in course_slugs
                     ]
@@ -250,6 +293,7 @@ def retrieve_hybrid(
                             question,
                             candidate_limit,
                             course_slugs=[course_slug],
+                            sources=sources,
                         )
                         for course_slug in course_slugs
                     ]
@@ -260,12 +304,14 @@ def retrieve_hybrid(
                     vector,
                     candidate_limit,
                     course_slugs=course_slugs,
+                    sources=sources,
                 )
                 sparse_rows = _fetch_sparse_candidates(
                     cursor,
                     question,
                     candidate_limit,
                     course_slugs=course_slugs,
+                    sources=sources,
                 )
 
     return _fuse_candidates(dense_rows, sparse_rows, top_k)
@@ -288,12 +334,13 @@ def _fetch_dense_candidates(
     vector: str,
     limit: int,
     course_slugs: list[str] | None = None,
+    sources: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if course_slugs:
+    if course_slugs or sources:
         # pgvector ivfflat can return zero rows for selective metadata filters
         # because the filter is applied after approximate candidate selection.
-        # Course-scoped queries are small enough for an exact scan, and exact
-        # filtering is much safer for compare/course-specific retrieval.
+        # Filtered queries are small enough for an exact scan, and exact
+        # filtering is much safer for compare/source-specific retrieval.
         cursor.execute("SET LOCAL enable_indexscan = off")
         cursor.execute("SET LOCAL enable_bitmapscan = off")
 
@@ -315,14 +362,15 @@ def _fetch_dense_candidates(
         FROM chunks
         JOIN documents ON documents.id = chunks.document_id
         WHERE (%s::text[] IS NULL OR documents.course_slug = ANY(%s::text[]))
+            AND (%s::text[] IS NULL OR documents.source = ANY(%s::text[]))
         ORDER BY chunks.embedding <=> %s::vector
         LIMIT %s
         """,
-        (vector, course_slugs, course_slugs, vector, limit),
+        (vector, course_slugs, course_slugs, sources, sources, vector, limit),
     )
     rows = list(cursor.fetchall())
 
-    if course_slugs:
+    if course_slugs or sources:
         cursor.execute("SET LOCAL enable_indexscan = on")
         cursor.execute("SET LOCAL enable_bitmapscan = on")
 
@@ -346,6 +394,7 @@ def _fetch_sparse_candidates(
     question: str,
     limit: int,
     course_slugs: list[str] | None = None,
+    sources: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     cursor.execute(
         """
@@ -370,12 +419,23 @@ def _fetch_sparse_candidates(
         CROSS JOIN query
         WHERE query.tsq @@ to_tsvector('english', chunks.text)
             AND (%s::text[] IS NULL OR documents.course_slug = ANY(%s::text[]))
+            AND (%s::text[] IS NULL OR documents.source = ANY(%s::text[]))
         ORDER BY sparse_score DESC
         LIMIT %s
         """,
-        (question, course_slugs, course_slugs, limit),
+        (question, course_slugs, course_slugs, sources, sources, limit),
     )
     return list(cursor.fetchall())
+
+
+def resolve_source_filter(question: str) -> list[str] | None:
+    normalized_question = _normalize_text(question)
+    matched = [
+        source
+        for source, hints in SOURCE_HINTS.items()
+        if any(_phrase_matches(normalized_question, _normalize_text(hint)) for hint in hints)
+    ]
+    return matched or None
 
 
 def resolve_course_scopes(question: str) -> list[dict[str, Any]]:
@@ -420,6 +480,9 @@ def resolve_course_scopes(question: str) -> list[dict[str, Any]]:
             matched[course["slug"]] = course
         if _phrase_matches(normalized_question, name_phrase):
             matched[course["slug"]] = course
+        for alias in COURSE_ALIASES.get(course["slug"], ()):
+            if _alias_matches(normalized_question, _normalize_text(alias)):
+                matched[course["slug"]] = course
 
     return list(matched.values())
 
@@ -434,6 +497,14 @@ def _normalize_text(value: str) -> str:
 
 def _phrase_matches(normalized_question: str, normalized_phrase: str) -> bool:
     return len(normalized_phrase) >= 6 and normalized_phrase in normalized_question
+
+
+def _alias_matches(normalized_question: str, normalized_alias: str) -> bool:
+    if not normalized_alias:
+        return False
+    if len(normalized_alias) >= 6:
+        return _phrase_matches(normalized_question, normalized_alias)
+    return normalized_alias in normalized_question.split()
 
 
 def _fuse_candidates(

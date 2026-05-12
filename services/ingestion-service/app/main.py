@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import uuid
+from hashlib import sha256
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -14,9 +16,14 @@ from app.scrapers.reddit import RedditClient
 from shared.schemas.models import (
     CourseCatalogEntry,
     CourseReview,
+    DeleteDocumentsRequest,
+    DeleteDocumentsResponse,
     IndexCoursesRequest,
     IndexCoursesResponse,
     IndexJobStatus,
+    IndexRedditRequest,
+    ManualRedditDocumentRequest,
+    ManualRedditDocumentResponse,
     OMSCentralScrapeRequest,
     OMSCentralScrapeResponse,
     RedditDocument,
@@ -223,6 +230,28 @@ def upsert_reviews(reviews: list[CourseReview]) -> int:
     return len(reviews)
 
 
+def delete_documents(request: DeleteDocumentsRequest) -> DeleteDocumentsResponse:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM documents
+                WHERE id = ANY(%s::text[])
+                    AND (%s::text IS NULL OR source = %s)
+                RETURNING id
+                """,
+                (request.document_ids, request.source, request.source),
+            )
+            deleted_ids = [row["id"] for row in cursor.fetchall()]
+        connection.commit()
+
+    return DeleteDocumentsResponse(
+        requested_count=len(request.document_ids),
+        deleted_count=len(deleted_ids),
+        deleted_document_ids=deleted_ids,
+    )
+
+
 def create_index_job(request: IndexCoursesRequest) -> str:
     job_id = str(uuid.uuid4())
     with db_connection() as connection:
@@ -330,6 +359,70 @@ def get_indexed_course_slugs() -> set[str]:
             return {row["course_slug"] for row in cursor.fetchall()}
 
 
+def get_reddit_indexed_course_slugs() -> set[str]:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT documents.course_slug
+                FROM documents
+                JOIN chunks ON chunks.document_id = documents.id
+                WHERE documents.source = 'reddit'
+                    AND documents.course_slug IS NOT NULL
+                    AND documents.course_slug != ''
+                """
+            )
+            return {row["course_slug"] for row in cursor.fetchall()}
+
+
+def get_course_catalog_entry(slug: str) -> CourseCatalogEntry | None:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    course_id,
+                    source,
+                    slug,
+                    name,
+                    codes,
+                    credit_hours,
+                    description,
+                    rating,
+                    difficulty,
+                    workload,
+                    review_count,
+                    official_url,
+                    syllabus_url,
+                    metadata
+                FROM course_catalog
+                WHERE slug = %s
+                """,
+                (slug,),
+            )
+            row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return CourseCatalogEntry(
+        course_id=row["course_id"],
+        source=row["source"],
+        slug=row["slug"],
+        name=row["name"],
+        codes=row["codes"] or [],
+        credit_hours=row["credit_hours"],
+        description=row["description"],
+        rating=row["rating"],
+        difficulty=row["difficulty"],
+        workload=row["workload"],
+        review_count=row["review_count"],
+        official_url=row["official_url"],
+        syllabus_url=row["syllabus_url"],
+        metadata=row["metadata"] or {},
+    )
+
+
 def _index_job_from_row(row: dict[str, Any]) -> IndexJobStatus:
     return IndexJobStatus(
         job_id=row["id"],
@@ -351,6 +444,18 @@ def _index_job_from_row(row: dict[str, Any]) -> IndexJobStatus:
     )
 
 
+def create_reddit_index_job(request: IndexRedditRequest) -> str:
+    return create_index_job(
+        IndexCoursesRequest(
+            course_slugs=request.course_slugs,
+            missing_only=request.missing_only,
+            include_reviews=True,
+            process_after=request.process_after,
+            limit=request.limit,
+        )
+    )
+
+
 @app.post("/index/courses", response_model=IndexCoursesResponse)
 async def start_course_index(
     request: IndexCoursesRequest,
@@ -362,6 +467,20 @@ async def start_course_index(
         job_id=job_id,
         status="queued",
         message="Course indexing job queued.",
+    )
+
+
+@app.post("/index/reddit", response_model=IndexCoursesResponse)
+async def start_reddit_index(
+    request: IndexRedditRequest,
+    background_tasks: BackgroundTasks,
+) -> IndexCoursesResponse:
+    job_id = create_reddit_index_job(request)
+    background_tasks.add_task(run_reddit_index_job, job_id, request)
+    return IndexCoursesResponse(
+        job_id=job_id,
+        status="queued",
+        message="Reddit indexing job queued.",
     )
 
 
@@ -465,6 +584,103 @@ async def run_course_index_job(job_id: str, request: IndexCoursesRequest) -> Non
         )
     finally:
         await client.aclose()
+
+
+async def run_reddit_index_job(job_id: str, request: IndexRedditRequest) -> None:
+    errors: list[dict[str, str]] = []
+    documents_persisted = 0
+    omscentral_client = OMSCentralClient(settings)
+    reddit_client = RedditClient(settings)
+
+    update_index_job(
+        job_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    )
+    try:
+        catalog = await omscentral_client.fetch_catalog()
+        catalog_by_slug = {course.slug: course for course in catalog}
+
+        if request.course_slugs:
+            missing = sorted(
+                slug for slug in request.course_slugs if slug not in catalog_by_slug
+            )
+            if missing:
+                raise ValueError(f"Unknown course slugs: {', '.join(missing)}")
+            selected_courses = [catalog_by_slug[slug] for slug in request.course_slugs]
+        else:
+            selected_courses = catalog
+
+        if request.missing_only:
+            indexed_slugs = get_reddit_indexed_course_slugs()
+            selected_courses = [
+                course for course in selected_courses if course.slug not in indexed_slugs
+            ]
+
+        if request.limit is not None:
+            selected_courses = selected_courses[: request.limit]
+
+        update_index_job(job_id, total_courses=len(selected_courses))
+
+        for index, course in enumerate(selected_courses, start=1):
+            try:
+                docs = await reddit_client.scrape_course_discussions(
+                    catalog,
+                    course_slugs=[course.slug],
+                    posts_per_course=request.posts_per_course,
+                    include_aliases=request.include_aliases,
+                    search_modes=request.search_modes,
+                    max_search_results_per_query=request.max_search_results_per_query,
+                )
+                persisted_docs = upsert_reddit_documents(docs)
+                documents_persisted += persisted_docs
+                DOCUMENTS_PERSISTED.labels(source="reddit").inc(persisted_docs)
+                for doc in docs:
+                    await publish_document_ingested(doc.document_id)
+            except Exception as exc:
+                errors.append(
+                    {
+                        "course_slug": course.slug,
+                        "error": str(exc),
+                    }
+                )
+
+            update_index_job(
+                job_id,
+                courses_indexed=index,
+                documents_persisted=documents_persisted,
+                errors=errors,
+            )
+
+        if request.process_after:
+            processing_result = await _process_indexed_documents()
+            errors.extend(processing_result["errors"])
+            update_index_job(
+                job_id,
+                processing_documents_processed=processing_result[
+                    "documents_processed"
+                ],
+                processing_chunks_created=processing_result["chunks_created"],
+                errors=errors,
+            )
+
+        update_index_job(
+            job_id,
+            status="completed_with_errors" if errors else "completed",
+            finished_at=datetime.now(timezone.utc),
+            errors=errors,
+        )
+    except Exception as exc:
+        errors.append({"course_slug": "", "error": str(exc)})
+        update_index_job(
+            job_id,
+            status="failed",
+            finished_at=datetime.now(timezone.utc),
+            errors=errors,
+        )
+    finally:
+        await omscentral_client.aclose()
+        await reddit_client.aclose()
 
 
 async def _process_indexed_documents() -> dict[str, Any]:
@@ -607,6 +823,11 @@ def upsert_reddit_documents(documents: list[RedditDocument]) -> int:
                         content = EXCLUDED.content,
                         content_hash = EXCLUDED.content_hash,
                         metadata = EXCLUDED.metadata,
+                        chunk_count = CASE
+                            WHEN documents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                            THEN 0
+                            ELSE documents.chunk_count
+                        END,
                         updated_at = NOW()
                     """,
                     {
@@ -637,6 +858,96 @@ def upsert_reddit_documents(documents: list[RedditDocument]) -> int:
     return persisted
 
 
+def build_manual_reddit_document(
+    request: ManualRedditDocumentRequest,
+    course: CourseCatalogEntry,
+) -> RedditDocument:
+    parsed_url = urlparse(request.url)
+    host = parsed_url.netloc.lower()
+    if "reddit.com" not in host:
+        raise HTTPException(
+            status_code=422,
+            detail="Manual Reddit sources must link to a reddit.com permalink.",
+        )
+
+    normalized_url = request.url.strip()
+    source_hash = sha256(
+        f"{request.course_slug}:{normalized_url}".encode("utf-8")
+    ).hexdigest()[:24]
+    content = request.content.strip()
+    content_hash = sha256(content.encode("utf-8")).hexdigest()
+
+    return RedditDocument(
+        document_id=f"reddit-manual-{source_hash}",
+        source_document_id=f"manual:{source_hash}",
+        title=request.title.strip(),
+        url=normalized_url,
+        author=request.author.strip() or "unknown",
+        score=request.score,
+        num_comments=request.num_comments,
+        published_at=request.published_at,
+        course_id=course.course_id,
+        course_slug=course.slug,
+        course_name=course.name,
+        course_codes=course.codes,
+        content=content,
+        content_hash=content_hash,
+        subreddit=request.subreddit.strip().removeprefix("r/") or "OMSCS",
+        metadata={
+            **request.metadata,
+            "ingestion_mode": "manual",
+            "curation_note": "Human-curated Reddit excerpt with permalink.",
+        },
+    )
+
+
+@app.post("/sources/reddit/manual", response_model=ManualRedditDocumentResponse)
+async def ingest_manual_reddit_source(
+    request: ManualRedditDocumentRequest,
+) -> ManualRedditDocumentResponse:
+    course = get_course_catalog_entry(request.course_slug)
+    if course is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown course slug: {request.course_slug}",
+        )
+
+    doc = build_manual_reddit_document(request, course)
+    persisted_count = upsert_reddit_documents([doc])
+    DOCUMENTS_PERSISTED.labels(source="reddit").inc(persisted_count)
+    await publish_document_ingested(doc.document_id)
+
+    processing_result = {
+        "documents_processed": 0,
+        "chunks_created": 0,
+        "errors": [],
+    }
+    if request.process_after:
+        processing_result = await _process_indexed_documents()
+
+    status = "persisted"
+    if processing_result["errors"]:
+        status = "persisted_with_processing_errors"
+    elif request.process_after:
+        status = "processed"
+
+    return ManualRedditDocumentResponse(
+        document_id=doc.document_id,
+        source_document_id=doc.source_document_id,
+        documents_persisted=persisted_count,
+        processing_documents_processed=processing_result["documents_processed"],
+        processing_chunks_created=processing_result["chunks_created"],
+        status=status,
+    )
+
+
+@app.post("/documents/delete", response_model=DeleteDocumentsResponse)
+async def delete_documents_route(
+    request: DeleteDocumentsRequest,
+) -> DeleteDocumentsResponse:
+    return delete_documents(request)
+
+
 @app.post("/sources/reddit/scrape", response_model=RedditScrapeResponse)
 async def scrape_reddit(request: RedditScrapeRequest) -> RedditScrapeResponse:
     # We need the course catalog for matching posts to courses.
@@ -655,6 +966,9 @@ async def scrape_reddit(request: RedditScrapeRequest) -> RedditScrapeResponse:
                 catalog,
                 course_slugs=request.course_slugs or None,
                 posts_per_course=request.posts_per_course,
+                include_aliases=request.include_aliases,
+                search_modes=request.search_modes,
+                max_search_results_per_query=request.max_search_results_per_query,
             )
             all_docs.extend(course_docs)
 
