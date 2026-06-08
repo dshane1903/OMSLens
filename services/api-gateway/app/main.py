@@ -48,10 +48,41 @@ app.add_middleware(
     allow_origin_regex=settings.frontend_cors_origin_regex or None,
 )
 
+READINESS_CHECKS = {
+    "ingestion": lambda: settings.ingestion_service_url,
+    "retrieval": lambda: settings.retrieval_service_url,
+    "processing": lambda: settings.processing_service_url,
+    "embedding": lambda: settings.embedding_service_url,
+    "llm": lambda: settings.llm_service_url,
+}
+
 
 @app.get("/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok", "service": "api-gateway"}
+
+
+@app.get("/ready")
+async def readiness() -> dict:
+    checks: dict[str, dict[str, str]] = {}
+
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        for name, get_url in READINESS_CHECKS.items():
+            try:
+                response = await client.get(f"{get_url()}/health")
+                checks[name] = {
+                    "status": "ok" if response.is_success else "error",
+                    "detail": str(response.status_code),
+                }
+            except httpx.HTTPError as exc:
+                checks[name] = {"status": "error", "detail": str(exc)}
+
+    status = (
+        "ok"
+        if all(check["status"] == "ok" for check in checks.values())
+        else "degraded"
+    )
+    return {"status": status, "service": "api-gateway", "checks": checks}
 
 
 def client_identity(request: Request) -> str:
