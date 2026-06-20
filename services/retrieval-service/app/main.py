@@ -7,12 +7,15 @@ from fastapi import FastAPI, HTTPException
 
 from shared.schemas.models import (
     CourseCatalogEntry,
+    CorpusStatsResponse,
+    CourseCorpusStats,
     CourseDocumentSummary,
     CourseDocumentsResponse,
     CourseListResponse,
     QueryRequest,
     QueryResponse,
     RetrievedChunk,
+    SourceCorpusStats,
 )
 from shared.utils.cache import get_cached_json, set_cached_json
 from shared.utils.config import get_settings
@@ -161,6 +164,78 @@ def list_course_documents(slug: str) -> CourseDocumentsResponse:
     return CourseDocumentsResponse(
         course_slug=slug,
         documents=[_document_from_row(row) for row in rows],
+    )
+
+
+@app.get("/corpus/stats", response_model=CorpusStatsResponse)
+def get_corpus_stats() -> CorpusStatsResponse:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM course_catalog)::integer AS course_count,
+                    (SELECT COUNT(*) FROM documents)::integer AS document_count,
+                    (SELECT COUNT(*) FROM chunks)::integer AS chunk_count
+                """
+            )
+            totals = cursor.fetchone()
+
+            cursor.execute(
+                """
+                SELECT
+                    documents.source,
+                    COUNT(DISTINCT documents.id)::integer AS document_count,
+                    COUNT(chunks.id)::integer
+                        AS chunk_count
+                FROM documents
+                LEFT JOIN chunks ON chunks.document_id = documents.id
+                GROUP BY documents.source
+                ORDER BY document_count DESC, source
+                """
+            )
+            source_rows = list(cursor.fetchall())
+
+            cursor.execute(
+                """
+                SELECT
+                    course_slug,
+                    course_name,
+                    course_codes,
+                    COUNT(DISTINCT documents.id)::integer AS document_count,
+                    COUNT(chunks.id)::integer
+                        AS chunk_count
+                FROM documents
+                LEFT JOIN chunks ON chunks.document_id = documents.id
+                GROUP BY course_slug, course_name, course_codes
+                ORDER BY document_count DESC, chunk_count DESC, course_name NULLS LAST
+                LIMIT 20
+                """
+            )
+            course_rows = list(cursor.fetchall())
+
+    return CorpusStatsResponse(
+        course_count=totals["course_count"],
+        document_count=totals["document_count"],
+        chunk_count=totals["chunk_count"],
+        source_breakdown=[
+            SourceCorpusStats(
+                source=row["source"],
+                document_count=row["document_count"],
+                chunk_count=row["chunk_count"],
+            )
+            for row in source_rows
+        ],
+        top_courses=[
+            CourseCorpusStats(
+                course_slug=row["course_slug"],
+                course_name=row["course_name"],
+                course_codes=row["course_codes"] or [],
+                document_count=row["document_count"],
+                chunk_count=row["chunk_count"],
+            )
+            for row in course_rows
+        ],
     )
 
 

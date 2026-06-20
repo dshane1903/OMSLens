@@ -275,6 +275,28 @@ class CourseDocumentsResponse(BaseModel):
     documents: list[CourseDocumentSummary] = Field(default_factory=list)
 
 
+class SourceCorpusStats(BaseModel):
+    source: str
+    document_count: int
+    chunk_count: int
+
+
+class CourseCorpusStats(BaseModel):
+    course_slug: str | None = None
+    course_name: str | None = None
+    course_codes: list[str] = Field(default_factory=list)
+    document_count: int
+    chunk_count: int
+
+
+class CorpusStatsResponse(BaseModel):
+    course_count: int
+    document_count: int
+    chunk_count: int
+    source_breakdown: list[SourceCorpusStats] = Field(default_factory=list)
+    top_courses: list[CourseCorpusStats] = Field(default_factory=list)
+
+
 class DocumentIngestedEvent(BaseModel):
     event: str = "document.ingested"
     document_id: str

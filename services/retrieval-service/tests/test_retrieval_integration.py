@@ -272,6 +272,45 @@ class RetrievalIntegrationTests(unittest.TestCase):
         self.assertIn("Course: Introduction to Graduate Algorithms (CS-6515)", context)
         self.assertIn("Evidence:\nStudents say the exams are stressful.", context)
 
+    @patch("app.main.db_connection")
+    def test_corpus_stats_route_summarizes_documents_and_chunks(self, db_connection):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "course_count": 13,
+            "document_count": 245,
+            "chunk_count": 512,
+        }
+        cursor.fetchall.side_effect = [
+            [
+                {"source": "omscentral", "document_count": 44, "chunk_count": 306},
+                {"source": "reddit", "document_count": 201, "chunk_count": 206},
+            ],
+            [
+                {
+                    "course_slug": "machine-learning",
+                    "course_name": "Machine Learning",
+                    "course_codes": ["CS-7641"],
+                    "document_count": 25,
+                    "chunk_count": 31,
+                }
+            ],
+        ]
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        db_connection.return_value = connection
+
+        response = self.client.get("/corpus/stats")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["course_count"], 13)
+        self.assertEqual(payload["document_count"], 245)
+        self.assertEqual(payload["chunk_count"], 512)
+        self.assertEqual(payload["source_breakdown"][0]["source"], "omscentral")
+        self.assertEqual(payload["source_breakdown"][1]["chunk_count"], 206)
+        self.assertEqual(payload["top_courses"][0]["course_slug"], "machine-learning")
+
     def test_rrf_fuses_dense_and_sparse_hits_without_duplicates(self):
         dense_rows = [
             candidate("doc-1", 0, "dense and sparse", dense_score=0.8),

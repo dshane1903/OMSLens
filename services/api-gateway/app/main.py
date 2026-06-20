@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from shared.schemas.models import (
     CourseCatalogEntry,
+    CorpusStatsResponse,
     CourseDocumentsResponse,
     CourseListResponse,
     DeleteDocumentsRequest,
@@ -339,6 +340,16 @@ async def list_course_documents(slug: str) -> CourseDocumentsResponse:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return CourseDocumentsResponse.model_validate(payload)
+
+
+@app.get("/corpus/stats", response_model=CorpusStatsResponse)
+async def get_corpus_stats() -> CorpusStatsResponse:
+    try:
+        payload = await get_json(f"{settings.retrieval_service_url}/corpus/stats")
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return CorpusStatsResponse.model_validate(payload)
 
 
 @app.post("/query", response_model=QueryResponse)
