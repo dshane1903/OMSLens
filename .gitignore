@@ -6,3 +6,8 @@ frontend/dist/
 
 __pycache__/
 *.py[cod]
+
+# Generated Reddit curation artifacts
+reddit-candidates*.csv
+reddit-raw*.csv
+reddit-source-audit*.csv
